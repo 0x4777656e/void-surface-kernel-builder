@@ -1,0 +1,191 @@
+#!/bin/bash
+# Create and build an XBPS kernel package w/linux-surface patches
+
+set -eo pipefail
+
+helptext() {
+    SCRIPTNAME="${0##*/}"
+    cat << EOF
+$SCRIPTNAME [options] [-- xbps-src-opts]
+
+Options:
+    -h, --help
+        Display the helptext
+
+    -v VERSION, --version VERSION
+        Build kernel version VERSION. This option expects the first two segments
+        of the version number, e.g. \"6.13\". If unspecified, defaults to the
+        latest version supported by both Void and linux-surface.
+
+    -a ARCH, --arch ARCH
+        Build the kernel for the target architecture ARCH. If unspecified,
+        defaults to the host architecture.
+
+    -c FILENAME, --config-file FILENAME
+        Apply the kernel configuration file FILENAME over the combined Void and
+        linux-surface config files.
+
+    -p FILENAME, --patch-file FILENAME
+        Apply the patch file FILENAME to the kernel.
+
+    --
+        Marks the end of $SCRIPTNAME options. All command line arguments past
+        this point are passed to xbps-src when building the kernel package.
+
+EOF
+}
+
+# parse options. anything after -- is passed to xbps-src
+while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
+    -h | --help )
+        helptext
+        exit 0
+        ;;
+    -v | --version )
+        shift
+        if [[ ! "$1" =~ ^[0-9]\.[0-9]{1,2}$ ]]; then
+            echo "Invalid version ${1}"
+            exit 1
+        fi
+        version=$1
+        ;;
+    -a | --arch )
+        shift
+        arch=$1
+        ;;
+    -c | --config-file )
+        shift
+        config_file=$1
+        ;;
+    -p | --patch-file )
+        shift
+        patches="${patches:+$patches }${1}"
+        ;;
+    * )
+        echo "Unrecognized option '${1}'"
+        echo $helptext
+        exit 1
+        ;;
+esac; shift; done
+if [[ "$1" == "--" ]]; then shift; fi
+
+# Ensure we have up-to-date copies of the void-packages and linux-surface repos
+if [[ -d "./void-packages" ]]; then
+    (cd void-packages; git pull >/dev/null 2>&1)
+else
+    git clone --depth 1 "https://github.com/void-linux/void-packages.git"
+    void-packages/xbps-src binary-boostrap
+fi
+
+if [[ -d "./linux-surface" ]]; then
+    (cd linux-surface; git pull >/dev/null 2>&1)
+else
+    git clone --depth 1 "https://github.com/void-linux/void-packages.git"
+fi
+
+# determine architecture if unset
+if [[ -z $arch ]]; then
+    arch=$(xbps-uhelper -C /dev/null arch)
+fi
+
+# determine latest available version if unset
+if [[ -z $version ]]; then
+    linux_surface_versions=$(ls -1 ./linux-surface/configs \
+        | sed -r 's/.*([0-9]\.[0-9]{1,2}).*/\1/')
+    void_linux_versions=$(ls ./void-packages/srcpkgs/ \
+        | grep -E 'linux[0-9]\.[0-9]{1,2}$' \
+        | sed -r 's/linux(.*)/\1/')
+    version=$(echo "${linux_surface_versions}\n${void_linux_versions}" \
+        | uniq -d \
+        | sort -rV \
+        | head -n 1)
+elif [[ ! -r "./linux-surface/configs/surface-${version}.config" ]]; then
+    echo "Linux ${version} is not supported by linux-surface"
+    exit 1
+elif [[ ! -r "./void-packages/srcpkgs/linux${version}" ]]; then
+    echo "Linux ${version} is not supported by Void"
+    exit 1
+fi
+
+pkgdir="./void-packages/srcpkgs"
+pkgname="linux${version}-surface"
+
+# confirm that the Void package provides a config for the target architecture
+if [[ ! -f "${pkgdir}/linux${version}/files/${arch}-dotconfig" ]]; then
+    echo "The Void package linux${version} does not have a config for ${arch}"
+    exit 1
+fi
+
+echo "Building version ${version} for ${arch}"
+
+# make new package directory in void-packages/srcpkgs/
+# add -dbg and -headers symlinks
+echo "Creating package directory: ./void-packages/srcpkgs/${pkgname}"
+
+mkdir -p "${pkgdir}/${pkgname}/files"
+
+ln -s "${pkgname}" "${pkgdir}/${pkgname}-dbg"
+ln -s "${pkgname}" "${pkgdir}/${pkgname}-headers"
+
+# copy template from existing kernel package for target version, updating
+# package name and kernel version.
+echo "Writing updated template file"
+
+sed -re "{
+    s/(linux[0-9].[0-9]{1,2})/\1-surface/
+    s/\\\$\{revision\}/\${revision}-surface/
+    }" \
+    "${pkgdir}/linux${version}/template" \
+    > "${pkgdir}/${pkgname}/template"
+
+# append linux-surface config, Void-specific options, and user config (if any)
+# to the Void config for this architecture
+echo "Combining Void and linux-surface kernel config"
+
+cp "${pkgdir}/linux${version}/files/${arch}-dotconfig" \
+    "${pkgdir}/${pkgname}/files/"
+
+cat <(echo) "./linux-surface/configs/surface-${version}.config" \
+    >> "${pkgdir}/${pkgname}/files/${arch}-dotconfig"
+
+cat >> "${pkgdir}/${pkgname}/files/${arch}-dotconfig" << EOF
+
+##
+## Non-Void Defaults
+##
+CONFIG_ACPI=y
+CONFIG_DMI=y
+CONFIG_SURFACE_GPE=y
+CONFIG_SERIAL_DEV_BUS=y
+CONFIG_SERIAL_DEV_CTRL_TTYPORT=y
+EOF
+
+if [[ -r $config_file ]]; then
+    echo "Applying config options from ${config_file}"
+    cat <(echo) $config_file \
+        >> "${pkgdir}/${pkgname}/files/${arch}-dotconfig"
+fi
+
+# copy patches from existing kernel package and linux-surface
+echo "Copying Void and linux-surface patches"
+
+cp -R "${pkgdir}/linux${version}/patches" "${pkgdir}/${pkgname}/"
+find "./linux-surface/patches/${version}/" -maxdepth 1 -type f \
+    -exec cp '{}' "${pkgdir}/${pkgname}/patches/" \;
+# cp -R "./linux-surface/patches/${version}" "${pkgdir}/${pkgname}/patches"
+
+if [[ ! -z $patches ]]; then
+    echo "Copying additional patches: ${patches}"
+
+    cp -t "${pkgdir}/${pkgname}/patches/" $patches
+fi
+
+# xgensum -i <pkgname> in srcpkgs/
+echo "Updating package checksums"
+
+(cd "${pkgdir}"; xgensum -i -a $arch $pkgname)
+
+# call xbps-src with any specified flags
+echo "Building package"
+
+./void-packages/xbps-src $@ pkg $pkgname
